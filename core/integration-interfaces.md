@@ -212,3 +212,45 @@ classification:
 - 审计结果直接输出给用户（替代任务体系）
 - 经验由用户手动管理（替代知识体系）
 - 无规则注入（使用 Harness 内置规则）
+
+---
+
+## 7. GitHub-First Ingestion Interface (Stage D P0)
+
+> Contract spec: `adapters/github/AGENTS.md`
+> Source of truth: [everwork-ai/IEF-Adapters#2](https://github.com/everwork-ai/IEF-Adapters/issues/2)
+
+The GitHub adapter normalizes GitHub events into `HostEvent` records and produces `TaskEnvelope` objects for downstream IEF consumers.
+
+### Data Flow
+
+```
+GitHub API  -->  adapters/github  -->  HostEvent  -->  TaskEnvelope  -->  IEF Program Controller
+```
+
+### Interface Summary
+
+| Component | Input | Output |
+|---|---|---|
+| GitHub Adapter | GitHub API responses (issue events, issue comments, PR comments) | `HostEvent` records |
+| TaskEnvelope Producer | `HostEvent` with `Label: ACTION REQUIRED` or directive marker | `TaskEnvelope` with `intent: directive` |
+
+### Key Shapes
+
+- **HostEvent**: Normalized event with `source_type`, `event_id`, `repo`, `entity_type`, `entity_id`, `actor`, `action`, `body`, `label`, `timestamp`, `fetched_at`.
+- **Dedupe Key**: `SHA-256(surface + ":" + event_id + ":" + action + ":" + timestamp)`
+- **TaskEnvelope**: `{ envelope_id, source_event_id, dedupe_key, intent, target_repo, target_pr, target_issue, actor, directive_text, created_at }`
+
+### Constraints
+
+- No-fake-completion: all ingested events must be traceable to a confirmed GitHub API response.
+- Identity from GitHub API `user.login` only; no adapter-inferred identities.
+- Idempotent replay with per-repo, per-source-type cursors.
+- Control character policy: no Unicode control chars, no BOM, no smart quotes.
+
+### Status
+
+| Interface | Status |
+|---|---|
+| Contract spec | **Defined** in `adapters/github/AGENTS.md` |
+| Runtime implementation | **Not started** (Stage D P0 boundary: contract spec only) |
