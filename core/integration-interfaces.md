@@ -207,6 +207,7 @@ classification:
 | 知识体系 → Harness | **格式已定义，未对接** | 等知识体系工程启动 |
 | Harness → 任务体系 | **格式已定义，未对接** | 等任务体系工程启动 |
 | 任务体系 → Harness | **格式已定义，未对接** | 等任务体系工程启动 |
+| GitHub → Adapters (Stage D) | **合约已定义** | `adapters/github/AGENTS.md`，仅合约规范 |
 
 当外部系统未接入时，Harness 按当前行为工作：
 - 审计结果直接输出给用户（替代任务体系）
