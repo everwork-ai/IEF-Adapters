@@ -255,3 +255,114 @@ GitHub API  -->  adapters/github  -->  HostEvent  -->  TaskEnvelope  -->  IEF Pr
 |---|---|
 | Contract spec | **Defined** in `adapters/github/AGENTS.md` |
 | Runtime implementation | **Not started** (Stage D P0 boundary: contract spec only) |
+
+---
+
+## 8. Stage E Adapter Contract
+
+> Full adapter contract for Stage E: how adapters (GitHub, Hermes, OpenClaw, Qoder) receive external inputs, normalize them into `HostEvent`/`TaskEnvelope` schemas, and enforce boundary rules.
+> Cross-references: `core/adapter-event-envelope.md` (standalone schema reference), `core/adapter-boundary-rules.md` (standalone may/may-not reference).
+> Source: [IEF-Adapters#2 contract plan comment 4646579402](https://github.com/everwork-ai/IEF-Adapters/issues/2#issuecomment-4646579402), CONDITIONALLY_PASSED (comment 4656021244), implementation plan PASSED (comment 4656639817).
+
+### 8.1 Input Channels
+
+| Adapter | Input Channel | Trigger Mechanism | Notes |
+|---|---|---|---|
+| **GitHub** | Webhooks (issue_comment, pull_request_review, push, issues events) | GitHub webhook POST → local ingest endpoint | Stage D already defines `HostEvent` schema; Stage E extends it |
+| **Hermes** | Skill invocation (CLI / API call) | Hermes agent calls skill → adapter intercepts | Synchronous; bounded to skill execution context |
+| **OpenClaw** | Cron jobs, tool invocations, session messages | OpenClaw runtime fires event → adapter listens | Async and sync; includes cron-triggered work |
+| **Qoder** | Agent turn start, rule evaluation, skill execution | Qoder runtime hooks → adapter consumes | Synchronous within coding-agent lifecycle |
+| **Future** | Any external system | Adapter-specific connector | Must implement Stage E event envelope on output side |
+
+### 8.2 Reception Protocol
+
+All adapters implement a **two-phase reception**:
+
+1. **Capture phase** — receive raw external event, attach metadata (source system, timestamp, identity, raw payload hash).
+2. **Acknowledge phase** — return deterministic ack to the source system (e.g., HTTP 202 for webhooks, skill return value for CLI) without processing the event content yet.
+
+The raw event must be stored verbatim in a local staging area (filesystem or memory) before normalization begins. This ensures replayability and auditability.
+
+### 8.3 Reception Rules
+
+- Adapters **must** capture the raw payload unchanged.
+- Adapters **must** record a SHA-256 hash of the raw payload for dedup (Stage D §1.2).
+- Adapters **must not** interpret or act on event content before normalization.
+- Adapters **must** reject malformed inputs at capture time with a clear error code (e.g., `INVALID_PAYLOAD`, `MISSING_REQUIRED_FIELD`).
+
+### 8.4 Normalization Pipeline
+
+```
+Raw External Event
+  → Capture (verbatim storage + hash)
+  → Validate (schema check, auth check, dedup check)
+  → Normalize (map to HostEvent schema)
+  → Envelope (wrap in TaskEnvelope with metadata)
+  → Forward (deliver to PM / Coordinator via defined path)
+```
+
+### 8.5 HostEvent Schema
+
+```json
+{
+  "host_event_id": "<uuid-v4>",
+  "source": {
+    "system": "<github|hermes|openclaw|qoder|...>",
+    "adapter": "<adapter-name>",
+    "raw_payload_hash": "<sha256-hex>",
+    "raw_event_ref": "<local staging path or external ref>"
+  },
+  "ingested_at": "<ISO-8601 timestamp>",
+  "event_type": "<issue_comment|pr_review|cron_trigger|skill_invocation|...>",
+  "entity": {
+    "repo": "<owner/repo>",
+    "issue_number": "<number or null>",
+    "pr_number": "<number or null>",
+    "comment_id": "<id or null>",
+    "branch": "<branch or null>",
+    "commit_sha": "<sha or null>"
+  },
+  "actor": "<github-login|system-id>",
+  "directive_text": "<extracted instruction or null>",
+  "labels": ["<label-1>", "..."],
+  "classification_hint": "<optional PM classification hint>"
+}
+```
+
+### 8.6 Normalization Rules
+
+- Each adapter **must** map its native event format to `HostEvent`.
+- `classification_hint` is optional — adapters may suggest a classification based on `Label:` patterns or trigger-file naming conventions, but the **PM owns final classification**.
+- If the adapter cannot produce a valid `HostEvent`, it **must** emit a `HostEvent` with `event_type: "normalization_failure"` and include the error in `directive_text`.
+- Normalization **must not** mutate the source system.
+
+### 8.7 TaskEnvelope Schema
+
+```json
+{
+  "envelope_id": "<uuid-v4>",
+  "host_event": "<HostEvent object>",
+  "control_plane_action": "<dispatch|ack|escalate|dedup_consume>",
+  "priority": "<normal|urgent|blocker>",
+  "routing_hint": {
+    "target_repo": "<owner/repo>",
+    "target_issue_or_pr": "<number>",
+    "task_type": "<optional task type hint>"
+  },
+  "created_at": "<ISO-8601>"
+}
+```
+
+### 8.8 Envelope Integrity Rules
+
+1. **Immutable raw reference** — `source.raw_payload_hash` must never change after capture.
+2. **Traceability** — every `TaskEnvelope` must be traceable back to its raw payload via `source.raw_event_ref`.
+3. **Deterministic dedup** — dedup key is `sha256(raw_payload + source.system + event_type)` (Stage D §1.2).
+4. **No synthetic events** — adapters must not generate `HostEvent` objects without a real external input.
+5. **Envelope versioning** — envelope schema includes a `schema_version` field (initial: `"v1"`) to support future evolution without breaking compatibility.
+
+### 8.9 Open Questions
+
+1. **Batch forwarding** — Should adapters support multiple `TaskEnvelope` objects in one delivery? Proposed: single-envelope forwarding only for Stage E. Batch support deferred.
+2. **Confidence score** — Should adapters produce a classification confidence alongside `classification_hint`? Proposed: no. `classification_hint` is sufficient; PM owns classification.
+3. **Staging area** — Filesystem-based or database-based for production? Proposed: filesystem-based for Stage E (simpler, auditable, git-compatible). Database deferred to production stage.

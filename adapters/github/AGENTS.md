@@ -1,204 +1,136 @@
-# IEF GitHub-First Ingestion Contract Spec
+# GitHub Adapter — Stage E Contract
 
-> Stage D P0 -- GitHub-first ingestion only.
-> Covers exactly three source types on one surface: GitHub Issues, GitHub Issue Comments, GitHub PR Comments.
-> Source of truth: [everwork-ai/IEF-Adapters#2 comment 4618584306](https://github.com/everwork-ai/IEF-Adapters/issues/2#issuecomment-4618584306)
+> Adapter contract for GitHub event ingestion, normalization, and envelope production.
+> Inherits boundary rules from `core/adapter-boundary-rules.md`.
+> Cross-references: `core/adapter-event-envelope.md`, `core/integration-interfaces.md` §8.
 
 ---
 
-## Scope Boundary
+## 1. Identity
 
-| Source Type | Surface | Scope |
+| Field | Value |
+|---|---|
+| Adapter name | GitHub Adapter |
+| System | `github` |
+| Registered input channels | Webhooks (issue_comment, pull_request_review, push, issues events) |
+| Trigger mechanism | GitHub webhook POST to local ingest endpoint |
+
+## 2. Input Channels
+
+This adapter captures the following GitHub events:
+
+| Event Type | Webhook Event | Description |
 |---|---|---|
-| Issue event | GitHub Issues | Opened, edited, labeled, commented |
-| Issue comment | GitHub Issues | Created, edited, deleted |
-| PR comment | GitHub Pull Requests | Review comments and issue-comments on PRs |
+| `issue_comment` | `issue_comment` (created, edited, deleted) | Comments on issues and PRs |
+| `pull_request_review` | `pull_request_review` (submitted, dismissed) | PR review submissions |
+| `push` | `push` | Git push events to any branch |
+| `issues` | `issues` (opened, edited, labeled, closed) | Issue lifecycle events |
 
-**Excluded:** chat/DM, CLI, IDE, browser, multi-surface adapters, real multi-runner integration, Knowledge memory promotion, Protocol schema redesign.
+## 3. Normalization Mapping
 
----
+Mapping from GitHub webhook payload fields to `HostEvent` fields:
 
-## Phase 1.1: Source Event Normalization
+| HostEvent Field | GitHub Source | Notes |
+|---|---|---|
+| `source.system` | literal: `"github"` | Constant |
+| `source.adapter` | `"github-adapter"` | Adapter instance name |
+| `source.raw_payload_hash` | `sha256(webhook_body)` | Verbatim payload hash |
+| `source.raw_event_ref` | `/staging/github/<date>/<event_id>.json` | Local staging path |
+| `ingested_at` | Current timestamp | ISO-8601 UTC |
+| `event_type` | webhook event type | e.g. `issue_comment`, `push` |
+| `entity.repo` | `repository.full_name` | e.g. `everwork-ai/IEF-Program` |
+| `entity.issue_number` | `issue.number` | Null for non-issue events |
+| `entity.pr_number` | `pull_request.number` | Null for non-PR events |
+| `entity.comment_id` | `comment.id` (string) | Null for non-comment events |
+| `entity.branch` | `ref` (push events) | Branch name from push ref |
+| `entity.commit_sha` | `push.after` or `pull_request.head.sha` | Commit SHA |
+| `actor` | `sender.login` | GitHub username |
+| `directive_text` | Extracted from `comment.body` or `issue.body` | `Label: ACTION REQUIRED` patterns |
+| `labels` | `issue.labels[].name` | Label array from issue/PR |
+| `classification_hint` | Extracted from body or labels | e.g. `STAGE_E_EXECUTION` |
 
-All three source types are normalized into a single `HostEvent` shape:
+## 4. Envelope Production
 
-```
-HostEvent {
-  source_type: github_issue | github_issue_comment | github_pr_comment
-  surface: github
-  event_id: <string>          // GitHub node_id or event_id
-  repo: <string>              // owner/repo
-  entity_type: issue | pull_request
-  entity_id: <number>         // issue/PR number
-  actor: <string>             // GitHub login
-  action: created | edited | labeled | deleted
-  body: <string | null>       // comment/issue body text
-  label: <string | null>      // label name if action=label
-  timestamp: <ISO-8601 UTC>
-  fetched_at: <ISO-8601 UTC>  // when adapter ingested it
-}
-```
+The GitHub adapter wraps a `HostEvent` into a `TaskEnvelope` as follows:
 
-### Field Rules
+1. Generate `envelope_id` (UUID v4).
+2. Set `schema_version` to `"v1"`.
+3. Copy the `HostEvent` into `host_event`.
+4. Determine `control_plane_action`:
+   - `dispatch` if labels contain `ACTION REQUIRED` or directive markers.
+   - `ack` for informational events.
+   - `dedup_consume` if the dedup key matches a previously processed event.
+5. Set `priority` based on label severity (`blocker`, `urgent`, `normal`).
+6. Populate `routing_hint` from `entity.repo`, `entity.issue_number`/`entity.pr_number`.
+7. Set `created_at` to current ISO-8601 timestamp.
 
-- `source_type` -- exactly one of: `github_issue`, `github_issue_comment`, `github_pr_comment`
-- `surface` -- always `github`
-- `event_id` -- MUST come from GitHub API (`node_id` or `id`), never adapter-generated. If missing, reject with `MALFORMED_EVENT`.
-- `repo` -- format `owner/repo`, extracted from GitHub API response.
-- `entity_type` -- `issue` for issue events/comments, `pull_request` for PR comments.
-- `entity_id` -- the issue or PR number from GitHub API.
-- `actor` -- from GitHub API `user.login`, never from adapter inference. If `user.login` is missing, reject with `IDENTITY_MISSING`.
-- `action` -- normalized from GitHub webhook/event `action` field.
-- `body` -- the text body. Null for events without body content (e.g., label-only actions).
-- `label` -- populated only when `action=label`, null otherwise.
-- `timestamp` -- from GitHub API event timestamp, ISO-8601 UTC.
-- `fetched_at` -- wall-clock time when the adapter successfully received the API response, ISO-8601 UTC.
+## 5. Boundary Rules
 
----
+The GitHub adapter inherits all boundary rules from `core/adapter-boundary-rules.md`.
 
-## Phase 1.2: Deterministic Dedupe Key
+### 5.1 Adapter-Specific Constraints
 
-```
-dedupe_key = SHA-256(surface + ":" + event_id + ":" + action + ":" + timestamp)
-```
+- **Webhook validation**: Must verify webhook signatures against configured secret before processing.
+- **Rate limiting**: Must respect GitHub API rate limits when fetching additional context.
+- **Pagination**: Must handle paginated API responses for issue/PR state queries.
+- **Idempotent replay**: Must support replay via per-repo, per-source-type cursors.
 
-### Dedupe Rules
+### 5.2 Inherited Prohibitions (Summary)
 
-- Same `event_id` + `action` with later `timestamp` -- overwrite, do not duplicate.
-- Different `action` on same `event_id` -- separate records.
-- `event_id` must come from GitHub API (not adapter-generated).
-- If `event_id` is missing -- reject with `MALFORMED_EVENT`, do not ingest.
-
-### Rationale
-
-The composite key of `surface:event_id:action:timestamp` ensures that:
-1. Events from different surfaces never collide (future-proofing for multi-surface).
-2. Edits to the same event produce updated records (overwrite semantics).
-3. Different actions on the same event (e.g., opened then labeled) remain distinct.
-
----
-
-## Phase 1.3: Idempotent Replay
-
-- Adapter must be restartable; replaying the same GitHub events produces identical `HostEvent` records.
-- Maintain a local cursor (per repo, per source type) of last-seen `event_id`.
-- On replay: fetch from cursor; compare each `dedupe_key` against existing records; skip if already present.
-- Order: events are stored in `fetched_at` order, not `action` order (no re-ordering guarantee beyond fetch sequence).
-- Recovery: if adapter crashes mid-ingest, restart from last confirmed cursor; no partial records.
-
-### Cursor Format
-
-```
-Cursor {
-  repo: <string>
-  source_type: github_issue | github_issue_comment | github_pr_comment
-  last_event_id: <string>
-  last_fetched_at: <ISO-8601 UTC>
-}
-```
-
-### Replay Guarantees
-
-1. **At-least-once delivery**: GitHub API may return duplicates within the cursor window. Dedupe key handles this.
-2. **No partial records**: An event is either fully persisted (with valid `dedupe_key`) or not persisted at all.
-3. **Cursor advancement**: Cursor advances only after successful persistence. A crash before persist does not advance the cursor.
-
----
-
-## Phase 1.4: TaskEnvelope Production
-
-Each accepted `HostEvent` produces zero or one `TaskEnvelope`:
-
-| Condition | Action |
+| Rule | Constraint |
 |---|---|
-| Issue with `Label: ACTION REQUIRED` | Produce `TaskEnvelope` with `intent: directive` |
-| Issue comment with `Label: ACTION REQUIRED` | Produce `TaskEnvelope` with `intent: directive` |
-| PR comment with directive marker | Produce `TaskEnvelope` with `intent: directive` |
-| All other events | No `TaskEnvelope`; log and discard (or store as `HostEvent` only for audit) |
+| P1 | Cannot mutate GitHub repo state beyond what the adapter is dispatched to do |
+| P3 | Cannot store task state outside GitHub or local staging |
+| P4 | Cannot auto-dispatch implementation work |
+| P6 | Cannot expand scope beyond registered webhook events |
+| P7 | Cannot close issues or merge PRs |
+| P8 | Cannot rewrite or delete raw captured webhook payloads |
 
-```
-TaskEnvelope {
-  envelope_id: <UUID>
-  source_event_id: <HostEvent.event_id>
-  dedupe_key: <string>
-  intent: directive
-  target_repo: <extracted from directive or default>
-  target_pr: <number | null>
-  target_issue: <number | null>
-  actor: <HostEvent.actor>
-  directive_text: <extracted body or null>
-  created_at: <ISO-8601 UTC>
-}
-```
+## 6. Dedup Strategy
 
-### Production Rules
+Dedup key for GitHub events:
 
-- `envelope_id` -- UUID v4, generated by adapter.
-- `source_event_id` -- must reference a valid, persisted `HostEvent`.
-- `dedupe_key` -- copied from the source `HostEvent`.
-- `intent` -- always `directive` for this stage.
-- `target_repo` -- extracted from directive text if present, otherwise defaults to the repo where the event originated.
-- `target_pr` / `target_issue` -- extracted from directive text or event context.
-- `directive_text` -- the full body text of the event that triggered the envelope.
+``
+dedup_key = sha256(webhook_body_bytes + "github" + webhook_event_type)
+``
 
----
+Components:
+- `webhook_body_bytes`: Raw HTTP POST body (UTF-8).
+- `"github"`: System identifier.
+- `webhook_event_type`: GitHub webhook event type header (e.g. `issue_comment`).
 
-## Phase 1.5: No-Fake-Completion Rule
+The adapter maintains a local dedup index keyed by this hash. Duplicate events receive `control_plane_action: "dedup_consume"`.
 
-> **Stage D Boundary -- this rule is non-negotiable.**
+## 7. Error Handling
 
-- Adapters MUST NOT claim successful ingestion without a confirmed GitHub API response (HTTP 200 + valid JSON).
-- Adapters MUST NOT generate synthetic `HostEvent` records from cached, assumed, or partial data.
-- If a GitHub API call fails (4xx/5xx/timeout) -- log failure, do not produce `TaskEnvelope`, retry on next cycle.
-- **Evidence required:** every ingested event must be traceable back to a GitHub API response with `event_id`, `fetched_at`, and HTTP status.
+### 7.1 Rejection Codes
 
-### Failure Handling
+| Code | Condition | Action |
+|---|---|---|
+| `INVALID_PAYLOAD` | Webhook body is not valid JSON | Reject at capture, log error |
+| `MISSING_REQUIRED_FIELD` | Required field absent (e.g. no `sender.login`) | Reject at capture, log error |
+| `INVALID_SIGNATURE` | Webhook signature verification fails | Reject at capture, log security event |
+| `DUPLICATE_EVENT` | Dedup key matches existing entry | Skip processing, return HTTP 202 |
+| `NORMALIZATION_FAILURE` | Cannot map to HostEvent schema | Emit normalization_failure HostEvent |
 
-| HTTP Status | Action |
+### 7.2 Normalization Failure Emission
+
+When normalization fails, the adapter emits a `HostEvent` with `event_type: "normalization_failure"` and includes the error code in `directive_text`.
+
+## 8. Stage E Event Mapping
+
+How this adapter responds to Stage E dispatch events:
+
+| Stage E Event | GitHub Adapter Action |
 |---|---|
-| 200 + valid JSON | Accept, produce `HostEvent`, advance cursor |
-| 200 + invalid JSON | Reject with `MALFORMED_RESPONSE`, log, do not advance cursor |
-| 4xx (client error) | Log with error code, skip event, advance cursor past it |
-| 5xx (server error) | Log, do not advance cursor, retry on next cycle |
-| Timeout / network error | Log, do not advance cursor, retry on next cycle |
-| Rate limited (403/429) | Log, backoff per `Retry-After` header, retry |
+| `STAGE_E_IMPLEMENTATION_PLAN` | Index as observation; no webhook action |
+| `STAGE_E_IMPLEMENTATION_REVIEW_RESULT` | If PASSED: proceed. If REWORK: await new directive |
+| `STAGE_E_EXECUTION_DISPATCH` | Capture webhook events per §2; normalize per §3; envelope per §4 |
+| `STAGE_E_EXECUTION_REPORT` | Forward execution report to control plane |
+| `STAGE_E_FAILURE_REPORT` | Emit failure envelope on boundary violation |
+| `STAGE_E_TARGET_COMPLETE` | Acknowledge via log entry |
+| `STAGE_E_CLOSURE_REPORT` | Final log entry; mark dedup index for archival |
 
 ---
 
-## Phase 1.6: Auth / Identity Boundary
-
-- `actor` comes from GitHub API `user.login` -- never from adapter inference.
-- Adapters do not authenticate, authorize, or trust any identity source other than GitHub's own API.
-- If `user.login` is missing -- reject with `IDENTITY_MISSING`.
-
-### Identity Rules
-
-1. **No inferred identities**: The adapter never guesses who performed an action. If GitHub does not provide `user.login`, the event is rejected.
-2. **No trust escalation**: The adapter does not evaluate whether an actor has permission to issue directives. That is the downstream consumer's responsibility.
-3. **No token storage in events**: Authentication tokens (GitHub PATs, app tokens) are used for API calls only and are never included in `HostEvent` records.
-
----
-
-## Implementation Notes
-
-### File Structure
-
-```
-adapters/github/
-  AGENTS.md          -- this contract spec
-  init.sh            -- bootstrap stub
-```
-
-### Integration Points
-
-- This adapter produces `HostEvent` and `TaskEnvelope` records.
-- Downstream consumers (IEF Program Controller, operator agents) consume `TaskEnvelope` to drive execution.
-- The adapter does not execute directives -- it only ingests and normalizes.
-
-### Control Character Policy
-
-All text fields in `HostEvent` and `TaskEnvelope` must be normalized:
-- No Unicode control characters (U+0000-U+001F except tab/newline, U+007F-U+009F).
-- No BOM (byte order mark).
-- No smart quotes or typographic substitutions.
-- Plain ASCII for structural fields; UTF-8 allowed in `body` and `directive_text` only after control character stripping.
+*Updated by ief-operator Stage E5 execution, 2026-06-09. Inherits from `core/adapter-boundary-rules.md` and `core/adapter-event-envelope.md`.*
