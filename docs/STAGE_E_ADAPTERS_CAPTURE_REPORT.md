@@ -174,4 +174,20 @@
 
 ---
 
-*Capture report produced by ief-operator Stage E5 execution, 2026-06-09. All entries are `observation` type until reviewed and promoted by Controller.*
+| Field | Value |
+|---|---|
+| Trigger | `ief_stage_e_e5_adapters_20260614_000000` |
+| Target | `everwork-ai/IEF-Adapters#2` |
+| Branch | `main` |
+| Operator | `ief-operator` (OpenClaw) |
+| Execution time | 2026-06-14T00:04:00+08:00 (Asia/Shanghai) |
+| HEAD SHA | `28da9ec` |
+| Review result | PASSED (comment 4656639817) |
+| Contract plan review | CONDITIONALLY_PASSED (comment 4656021244) |
+| Deliverables verified | D1–D8 (all present, unchanged from commit `aedf563`) |
+| Changes required | None — all deliverables already delivered |
+| Forbidden actions verified | Not attempted: merge, close, @codex review, cross-repo edits, code files |
+
+---
+
+*Capture report produced by ief-operator Stage E5 execution, 2026-06-09 / re-validated 2026-06-14. All entries are `observation` type until reviewed and promoted by Controller.*
